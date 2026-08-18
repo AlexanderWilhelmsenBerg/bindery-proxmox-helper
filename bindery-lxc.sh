@@ -1141,6 +1141,34 @@ BACKUP_READY=0
 # metacharacters and systemd's quoting rules are not Bash's quoting rules.
 HEALTH_PORT=8787
 HEALTH_URL_BASE=""
+
+# Match Bindery's URL-base normalization: accept a bare path, an absolute
+# path, or a full URL and keep only the path prefix used by the local health
+# endpoint. This matters after an operator adds BINDERY_URL_BASE to the env
+# file; a healthy upgrade must not be rolled back because the probe used the
+# wrong route.
+normalize_health_url_base() {
+  local value="$1" rest
+  if [[ "$value" == *"://"* ]]; then
+    rest=${value#*://}
+    if [[ "$rest" == */* ]]; then
+      value="/${rest#*/}"
+    else
+      value=""
+    fi
+  fi
+  while [[ "$value" == */ ]]; do
+    value=${value%/}
+  done
+  if [[ -z "$value" ]]; then
+    printf '%s' ""
+  elif [[ "$value" == /* ]]; then
+    printf '%s' "$value"
+  else
+    printf '/%s' "$value"
+  fi
+}
+
 if [[ -f "$ENV_FILE" ]]; then
   configured_port=$(sed -nE 's/^BINDERY_PORT="?([0-9]+)"?[[:space:]]*$/\1/p' "$ENV_FILE")
   configured_port=${configured_port%%$'\n'*}
@@ -1149,12 +1177,7 @@ if [[ -f "$ENV_FILE" ]]; then
   fi
   configured_url_base=$(sed -nE 's/^BINDERY_URL_BASE="?([^"[:space:]]*)"?[[:space:]]*$/\1/p' "$ENV_FILE")
   configured_url_base=${configured_url_base%%$'\n'*}
-  if [[ -n "$configured_url_base" && "$configured_url_base" == /* ]]; then
-    HEALTH_URL_BASE="$configured_url_base"
-    while [[ "$HEALTH_URL_BASE" == */ ]]; do
-      HEALTH_URL_BASE=${HEALTH_URL_BASE%/}
-    done
-  fi
+  HEALTH_URL_BASE=$(normalize_health_url_base "$configured_url_base")
 fi
 
 bindery_endpoint_is_healthy() {

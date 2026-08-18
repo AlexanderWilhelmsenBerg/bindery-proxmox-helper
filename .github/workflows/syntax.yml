@@ -19,6 +19,10 @@ jobs:
       - name: Install test dependencies
         run: sudo apt-get update && sudo apt-get install -y jq shellcheck
       - name: Run ShellCheck
-        run: shellcheck --severity=error bindery-lxc.sh tests/smoke.sh
+        run: shellcheck --severity=error bindery-lxc.sh tests/smoke.sh tests/live-bindery.sh
       - name: Run helper smoke tests
         run: bash tests/smoke.sh
+      - name: Verify the live upstream Bindery release contract
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bash tests/live-bindery.sh
