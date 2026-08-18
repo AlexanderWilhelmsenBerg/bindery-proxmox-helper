@@ -431,6 +431,43 @@ for maintenance_script in "$TMP/bindery-update" "$TMP/bindery-backup"; do
 done
 ok "updater and manual backup share a restrictive maintenance lock"
 
+# Tie the embedded updater to the live-release contract exercised by
+# tests/live-bindery.sh. These exact names come from upstream GoReleaser.
+grep -Fq '"https://api.github.com/repos/${REPO}/releases/latest"' "$TMP/bindery-update" \
+  || fail "updater does not resolve the official latest-release endpoint"
+grep -Fq 'ARCHIVE_NAME="bindery_${VERSION}_linux_${ARCH}.tar.gz"' "$TMP/bindery-update" \
+  || fail "updater release archive contract changed"
+grep -Fq 'CHECKSUM_NAME="bindery_${VERSION}_checksums.txt"' "$TMP/bindery-update" \
+  || fail "updater checksum asset contract changed"
+grep -Fq '[[ "$EXPECTED" == "$ACTUAL" ]]' "$TMP/bindery-update" \
+  || fail "updater does not fail closed on a checksum mismatch"
+grep -Fq 'ln -sfn "$TARGET" "$CURRENT_LINK"' "$TMP/bindery-update" \
+  || fail "fresh install does not activate the verified release"
+grep -Fq '/usr/local/sbin/bindery-update --install' "$TMP/install-inner.sh" \
+  || fail "inner installer never invokes the official-release installer"
+ok "embedded installer is linked to the live official-release contract"
+
+# The upstream binary accepts BINDERY_URL_BASE as a bare path, absolute path,
+# or full URL. Exercise the updater's isolated health-route normalizer so a
+# valid reverse-proxy configuration cannot trigger a false rollback.
+awk '/^normalize_health_url_base\(\) \{/{capture=1} capture{print} capture && /^}/{exit}' \
+  "$TMP/bindery-update" >"$TMP/url-base-function.sh"
+# shellcheck disable=SC1090
+source "$TMP/url-base-function.sh"
+[[ $(normalize_health_url_base '/bindery/') == '/bindery' ]] \
+  || fail "absolute URL base was not normalized"
+[[ $(normalize_health_url_base 'bindery') == '/bindery' ]] \
+  || fail "bare URL base was not normalized"
+[[ $(normalize_health_url_base 'https://books.example/bindery/') == '/bindery' ]] \
+  || fail "full URL base did not retain its path"
+[[ -z $(normalize_health_url_base 'https://books.example') ]] \
+  || fail "origin-only URL base did not normalize to root"
+[[ -z $(normalize_health_url_base '/') ]] \
+  || fail "root URL base did not normalize to empty"
+grep -Fq '"http://127.0.0.1:${HEALTH_PORT}${HEALTH_URL_BASE}/api/v1/health"' "$TMP/bindery-update" \
+  || fail "updater health probe does not use the normalized URL base"
+ok "updater health probe normalizes every upstream-supported URL-base form"
+
 grep -Fq 'BACKUP_TMP=$(mktemp "$BACKUP_ROOT/.pre-' "$TMP/bindery-update" || fail "staged update backup missing"
 grep -Fq 'tar -tzf "$BACKUP_TMP" >/dev/null' "$TMP/bindery-update" || fail "update backup validation missing"
 grep -Fq 'mv -- "$BACKUP_TMP" "$BACKUP"' "$TMP/bindery-update" || fail "atomic update backup publication missing"
