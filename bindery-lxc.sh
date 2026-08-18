@@ -155,6 +155,7 @@ valid_ipv4() {
     [[ "$octet" == "0" || "$octet" != 0* ]] || return 1
     (( 10#$octet <= 255 )) || return 1
   done
+  [[ "$ip" != "0.0.0.0" && "$ip" != "255.255.255.255" ]]
 }
 
 valid_ipv4_cidr() {
@@ -241,10 +242,11 @@ list_eligible_mounts() {
         | select((.target | contains("\t") | not) and (.target | contains("\r") | not) and (.target | contains("\n") | not))
         | [.target, .source, .fstype]
         | @tsv' \
-    | while IFS=$'\t' read -r target source fs; do
+      | while IFS=$'\t' read -r target source fs; do
         [[ "$target" =~ ^/(proc|sys|dev|run)(/|$) ]] && continue
         [[ "$target" =~ ^/etc/pve(/|$) ]] && continue
         [[ "$fs" =~ ^(proc|sysfs|devtmpfs|devpts|tmpfs|cgroup|cgroup2|securityfs|pstore|debugfs|tracefs|configfs|fusectl|mqueue|hugetlbfs|rpc_pipefs|efivarfs)$ ]] && continue
+        path_is_protected_host_path "$target" && continue
         [[ "$target" == *','* ]] && continue  # comma is a pct mount-option delimiter
         printf '%s\t%s\t%s\n' "$target" "$source" "$fs"
       done \
@@ -285,12 +287,121 @@ path_is_under() {
   [[ "$target" == "$base" || "$target" == "$base/"* ]]
 }
 
+mount_fstype_is_eligible() {
+  [[ "$1" != "" && ! "$1" =~ ^(proc|sysfs|devtmpfs|devpts|tmpfs|cgroup|cgroup2|securityfs|pstore|debugfs|tracefs|configfs|fusectl|mqueue|hugetlbfs|rpc_pipefs|efivarfs)$ ]]
+}
+
+mount_target_is_eligible() {
+  local target="$1"
+  [[ "$target" =~ ^/(proc|sys|dev|run)(/|$) ]] && return 1
+  [[ "$target" =~ ^/etc/pve(/|$) ]] && return 1
+  return 0
+}
+
+# Return success when a canonical host path is too broad or contains host/PVE
+# state that must never be exposed to the container. Purpose-built media
+# directories below /mnt, /media, /srv, or /home remain supported.
+path_is_protected_host_path() {
+  local canonical
+  canonical=$(realpath -m -- "$1")
+  case "$canonical" in
+    /|/bin|/bin/*|/boot|/boot/*|/dev|/dev/*|/etc|/etc/*|/lib|/lib/*|/lib32|/lib32/*|/lib64|/lib64/*|/opt|/opt/*|/proc|/proc/*|/root|/root/*|/run|/run/*|/sbin|/sbin/*|/sys|/sys/*|/tmp|/tmp/*|/usr|/usr/*)
+      return 0
+      ;;
+    /var|/var/lib|/var/lib/*|/var/cache|/var/cache/*|/var/log|/var/log/*|/var/run|/var/run/*|/var/spool|/var/spool/*|/var/tmp|/var/tmp/*)
+      return 0
+      ;;
+    /home|/media|/mnt|/mnt/pve|/srv|*/lost+found)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
 validate_bind_mount_path() {
   local path="$1" canonical
   [[ -d "$path" ]] || return 1
   [[ "$path" != *','* && "$path" != *$'\n'* && "$path" != *$'\r'* && "$path" != *$'\t'* ]] || return 1
   canonical=$(realpath -e -- "$path" 2>/dev/null) || return 1
-  [[ "$canonical" == "$path" ]]
+  [[ "$canonical" == "$path" ]] || return 1
+  ! path_is_protected_host_path "$canonical"
+}
+
+# Load the kernel mount identity containing a path into MOUNT_INFO_* globals.
+# "mountpoint" requires the path itself to be an active mount point; "target"
+# resolves the deepest mount containing the path.
+load_mount_identity() {
+  local path="$1" lookup="${2:-target}" json value
+  if [[ "$lookup" == "mountpoint" ]]; then
+    json=$(findmnt -J -M "$path" -o ID,TARGET,SOURCE,FSTYPE,UUID 2>/dev/null) || return 1
+  else
+    json=$(findmnt -J -T "$path" -o ID,TARGET,SOURCE,FSTYPE,UUID 2>/dev/null) || return 1
+  fi
+
+  MOUNT_INFO_ID=$(jq -er '.filesystems[0].id | tostring' <<<"$json") || return 1
+  MOUNT_INFO_TARGET=$(jq -er '.filesystems[0].target' <<<"$json") || return 1
+  MOUNT_INFO_SOURCE=$(jq -er '.filesystems[0].source' <<<"$json") || return 1
+  MOUNT_INFO_FSTYPE=$(jq -er '.filesystems[0].fstype' <<<"$json") || return 1
+  MOUNT_INFO_UUID=$(jq -r '.filesystems[0].uuid // ""' <<<"$json") || return 1
+  MOUNT_INFO_TARGET=$(realpath -e -- "$MOUNT_INFO_TARGET" 2>/dev/null) || return 1
+
+  for value in "$MOUNT_INFO_TARGET" "$MOUNT_INFO_SOURCE" "$MOUNT_INFO_FSTYPE" "$MOUNT_INFO_UUID"; do
+    [[ "$value" != *$'\n'* && "$value" != *$'\r'* && "$value" != *$'\t'* ]] || return 1
+  done
+}
+
+capture_selected_mount() {
+  local prefix="$1" drive="$2" path="$3"
+  local selected_id selected_target selected_source selected_fstype selected_uuid
+
+  load_mount_identity "$drive" mountpoint || return 1
+  mount_target_is_eligible "$MOUNT_INFO_TARGET" || return 1
+  mount_fstype_is_eligible "$MOUNT_INFO_FSTYPE" || return 1
+  [[ "$MOUNT_INFO_TARGET" == "$drive" ]] || return 1
+  selected_id=$MOUNT_INFO_ID
+  selected_target=$MOUNT_INFO_TARGET
+  selected_source=$MOUNT_INFO_SOURCE
+  selected_fstype=$MOUNT_INFO_FSTYPE
+  selected_uuid=$MOUNT_INFO_UUID
+
+  load_mount_identity "$path" target || return 1
+  [[ "$MOUNT_INFO_ID" == "$selected_id" && "$MOUNT_INFO_TARGET" == "$selected_target" ]] || return 1
+
+  printf -v "${prefix}_MOUNT_ID" '%s' "$selected_id"
+  printf -v "${prefix}_MOUNT_TARGET" '%s' "$selected_target"
+  printf -v "${prefix}_MOUNT_SOURCE" '%s' "$selected_source"
+  printf -v "${prefix}_MOUNT_FSTYPE" '%s' "$selected_fstype"
+  printf -v "${prefix}_MOUNT_UUID" '%s' "$selected_uuid"
+}
+
+revalidate_selected_mount() {
+  local prefix="$1" drive="$2" path="$3"
+  local name expected_id expected_target expected_source expected_fstype expected_uuid
+  name="${prefix}_MOUNT_ID"; expected_id=${!name}
+  name="${prefix}_MOUNT_TARGET"; expected_target=${!name}
+  name="${prefix}_MOUNT_SOURCE"; expected_source=${!name}
+  name="${prefix}_MOUNT_FSTYPE"; expected_fstype=${!name}
+  name="${prefix}_MOUNT_UUID"; expected_uuid=${!name}
+
+  [[ "$(realpath -e -- "$drive" 2>/dev/null)" == "$drive" ]] || return 1
+  validate_bind_mount_path "$path" || return 1
+  load_mount_identity "$drive" mountpoint || return 1
+  [[ "$MOUNT_INFO_ID" == "$expected_id" && "$MOUNT_INFO_TARGET" == "$expected_target" \
+      && "$MOUNT_INFO_SOURCE" == "$expected_source" && "$MOUNT_INFO_FSTYPE" == "$expected_fstype" \
+      && "$MOUNT_INFO_UUID" == "$expected_uuid" ]] || return 1
+  load_mount_identity "$path" target || return 1
+  [[ "$MOUNT_INFO_ID" == "$expected_id" && "$MOUNT_INFO_TARGET" == "$expected_target" ]]
+}
+
+revalidate_media_mounts() {
+  revalidate_selected_mount DOWNLOAD "$DOWNLOAD_DRIVE" "$DOWNLOAD_PATH" \
+    && revalidate_selected_mount AUDIOBOOK "$AUDIOBOOK_DRIVE" "$AUDIOBOOK_PATH" \
+    || return 1
+  if [[ "$MEDIA_LAYOUT" == "single" ]]; then
+    validate_bind_mount_path "$MEDIA_HOST_BASE" || return 1
+    load_mount_identity "$MEDIA_HOST_BASE" target || return 1
+    [[ "$MOUNT_INFO_ID" == "$DOWNLOAD_MOUNT_ID" && "$MOUNT_INFO_TARGET" == "$DOWNLOAD_MOUNT_TARGET" ]] || return 1
+  fi
 }
 
 folder_browser() {
@@ -417,19 +528,29 @@ select_media_storage() {
 
   if ! validate_bind_mount_path "$DOWNLOAD_PATH" || ! validate_bind_mount_path "$AUDIOBOOK_PATH"; then
     wt_msg "Unsupported Media Path" \
-      "The selected media paths must be real directories without commas or symlink components.\n\nProxmox bind-mount syntax uses commas as option separators and does not permit symlinks in bind-mount source paths.\n\nDownloads: $DOWNLOAD_PATH\nAudiobooks: $AUDIOBOOK_PATH" 20 92
+      "The selected media paths must be dedicated, canonical media directories without commas or symlink components. Host system/PVE paths and overly broad roots such as /, /var, /etc, /mnt, and /mnt/pve are never exposed.\n\nDownloads: $DOWNLOAD_PATH\nAudiobooks: $AUDIOBOOK_PATH" 21 96
     return 1
   fi
 
-  local download_dev audiobook_dev
-  download_dev=$(stat -Lc '%d' -- "$DOWNLOAD_PATH" 2>/dev/null || echo unknown-download)
-  audiobook_dev=$(stat -Lc '%d' -- "$AUDIOBOOK_PATH" 2>/dev/null || echo unknown-audio)
+  if ! capture_selected_mount DOWNLOAD "$DOWNLOAD_DRIVE" "$DOWNLOAD_PATH" \
+      || ! capture_selected_mount AUDIOBOOK "$AUDIOBOOK_DRIVE" "$AUDIOBOOK_PATH"; then
+    wt_msg "Media Mount Changed" \
+      "A selected folder is not on the exact eligible mount that you chose. This can happen when a network/disk mount went offline, a path crosses into a nested mount, or the mount changed during selection.\n\nNo bind mount will be created. Restore the host mount and select the folders again." 19 92
+    return 1
+  fi
 
-  if [[ "$DOWNLOAD_DRIVE" == "$AUDIOBOOK_DRIVE" && "$download_dev" == "$audiobook_dev" ]]; then
+  if [[ "$DOWNLOAD_MOUNT_ID" == "$AUDIOBOOK_MOUNT_ID" ]]; then
     MEDIA_HOST_BASE=$(common_ancestor "$DOWNLOAD_PATH" "$AUDIOBOOK_PATH")
-    # Never expose the Proxmox host root as a bind mount. If the only common
-    # ancestor is /, use two narrow mounts instead.
-    if [[ "$MEDIA_HOST_BASE" != "/" ]]; then
+    # The common path must be safe and resolve to the same live kernel mount as
+    # both leaves. Otherwise a nested mount boundary could make the apparent
+    # common ancestor unsafe for hardlinks or expose an underlying directory.
+    local common_mount_ok=0
+    if validate_bind_mount_path "$MEDIA_HOST_BASE" \
+        && load_mount_identity "$MEDIA_HOST_BASE" target \
+        && [[ "$MOUNT_INFO_ID" == "$DOWNLOAD_MOUNT_ID" && "$MOUNT_INFO_TARGET" == "$DOWNLOAD_MOUNT_TARGET" ]]; then
+      common_mount_ok=1
+    fi
+    if (( common_mount_ok == 1 )); then
       MEDIA_LAYOUT="single"
       local drel arel
       drel=$(relative_to "$MEDIA_HOST_BASE" "$DOWNLOAD_PATH")
@@ -442,9 +563,9 @@ select_media_storage() {
       MEDIA_HOST_BASE=""
       DOWNLOAD_CT="/data/downloads"
       AUDIOBOOK_CT="/data/audiobooks"
-      HARDLINK_STATUS="NO - safe split mounts; host / is never exposed"
+      HARDLINK_STATUS="NO - safe split mounts; common parent is protected or crosses a mount"
       wt_msg "Safe Storage Layout" \
-        "Both folders are on the Proxmox root filesystem but their only common parent is /.\n\nThe helper will NOT expose the host root filesystem inside the LXC. It will use two narrow folder mounts instead, so Bindery will copy rather than hardlink between them." 18 86
+        "The folders share a filesystem, but their common parent is protected or does not have the same live mount identity as both selected folders.\n\nThe helper will use two narrow folder mounts instead of exposing that parent. Bindery will copy rather than hardlink between them." 19 90
     fi
   else
     MEDIA_LAYOUT="split"
@@ -453,7 +574,7 @@ select_media_storage() {
     AUDIOBOOK_CT="/data/audiobooks"
     HARDLINK_STATUS="NO - separate LXC mounts; Bindery will fall back to copy"
     wt_msg "Separate filesystems" \
-      "Downloads and audiobooks are on different mounted filesystems (or different selected mounts).\n\nThis is fully supported, but Bindery cannot hardlink between separate LXC mounts. Completed audiobooks will normally be copied into the library instead.\n\nFor zero-copy imports/seeding, keep both folders on one filesystem under one common parent mount." 19 86
+      "Downloads and audiobooks have different live mount identities.\n\nThis is fully supported, but Bindery cannot hardlink between separate LXC mounts. Completed audiobooks will normally be copied into the library instead.\n\nFor zero-copy imports/seeding, keep both folders on one filesystem under one safe common parent mount." 19 88
   fi
 
   LIBRARY_CT="$AUDIOBOOK_CT"
@@ -481,6 +602,16 @@ select_media_storage() {
 }
 
 # ---------- container wizard ----------
+select_ipv6_mode() {
+  IPV6_MODE=$(whiptail --backtitle "Bindery Proxmox VE Helper" --title "IPv6" \
+    --menu "Choose how Proxmox should configure IPv6 for this container:" \
+    17 86 6 \
+    "auto" "SLAAC/router advertisements (recommended when IPv6 is available)" \
+    "dhcp" "Use DHCPv6" \
+    "manual" "Do not configure an IPv6 address automatically" \
+    3>&1 1>&2 2>&3) || return 1
+}
+
 default_settings() {
   CTID=$(next_ctid)
   HOSTNAME="$DEFAULT_HOSTNAME"
@@ -502,6 +633,7 @@ default_settings() {
   UNPRIVILEGED=1
   ROOT_PASSWORD=""
   ENABLE_SSH=0
+  TELEMETRY_DISABLED=1
   TAGS="$DEFAULT_TAGS"
 }
 
@@ -607,14 +739,35 @@ select_permission_mode() {
   fi
 }
 
+select_telemetry() {
+  local choice
+  choice=$(whiptail --backtitle "Bindery Proxmox VE Helper" --title "Bindery Telemetry" \
+    --menu "Upstream Bindery release builds normally send a telemetry ping immediately on first start and then once per day to api.getbindery.dev. The report includes a persistent installation ID, version/platform/deployment details, feature and setup counts, and coarse error metrics.\n\nChoose before Bindery is installed:" \
+    22 100 8 \
+    "disabled" "Disable before first start (recommended; no telemetry ping)" \
+    "enabled" "Allow Bindery's upstream anonymous usage telemetry" \
+    3>&1 1>&2 2>&3) || return 1
+
+  if [[ "$choice" == "enabled" ]]; then
+    TELEMETRY_DISABLED=0
+  else
+    TELEMETRY_DISABLED=1
+  fi
+}
+
 summary_and_confirm() {
-  local priv="Unprivileged" network media
+  local priv="Unprivileged" network media ipv6 telemetry
   (( UNPRIVILEGED == 0 )) && priv="Privileged"
   if [[ "$IPV4_MODE" == "dhcp" ]]; then
     network="DHCP"
   else
     network="$IPV4_CIDR via $GATEWAY"
   fi
+  case "$IPV6_MODE" in
+    auto) ipv6="SLAAC / auto" ;;
+    dhcp) ipv6="DHCPv6" ;;
+    manual) ipv6="Manual / no automatic address" ;;
+  esac
   if [[ "$MEDIA_LAYOUT" == "single" ]]; then
     media="ONE mount: $MEDIA_HOST_BASE -> /data"
   else
@@ -623,6 +776,11 @@ summary_and_confirm() {
 
   local remap="None"
   [[ -n "$DOWNLOAD_PATH_REMAP" ]] && remap="$DOWNLOAD_PATH_REMAP"
+  if (( TELEMETRY_DISABLED == 1 )); then
+    telemetry="Disabled before first start"
+  else
+    telemetry="Enabled for upstream Bindery"
+  fi
 
   wt_yesno "Ready to Create" \
 "Bindery LXC configuration
@@ -634,19 +792,22 @@ CPU / RAM / Swap:  $CORES core(s) / ${RAM} MB / ${SWAP} MB
 Root disk:         ${DISK} GB on $ROOTFS_STORAGE
 Container:         $priv
 Network:           $BRIDGE | $network${VLAN:+ | VLAN $VLAN}
+IPv6:              $ipv6
 Start on boot:     $ONBOOT
 SSH:               $ENABLE_SSH
 
 Downloads host:    $DOWNLOAD_PATH
 Audiobooks host:   $AUDIOBOOK_PATH
 Media mount:       $media
+Mount liveness:    Host pre-start guard
 Downloads in CT:   $DOWNLOAD_CT
 Audiobooks in CT:  $AUDIOBOOK_CT
 Hardlink capable:  $HARDLINK_STATUS
 Path remap:        $remap
 Permission mode:   $PERMISSION_MODE
+Telemetry:         $telemetry
 
-Create the container now?" 34 104
+Create the container now?" 35 104
 }
 
 # ---------- ACL handling ----------
@@ -674,14 +835,73 @@ grant_traverse_acl() {
   done
 }
 
+path_has_nested_mounts() {
+  local path="$1" json target
+  local -a targets=()
+  path=$(realpath -e -- "$path" 2>/dev/null) || return 2
+  json=$(findmnt -J -R -T "$path" -o TARGET 2>/dev/null) || return 2
+  jq -e '[.. | objects | .target? // empty]
+    | all(.[]; type == "string"
+        and (contains("\n") | not)
+        and (contains("\r") | not)
+        and (contains("\t") | not))' <<<"$json" >/dev/null || return 2
+  mapfile -t targets < <(jq -r '.. | objects | .target? // empty' <<<"$json")
+  for target in "${targets[@]}"; do
+    [[ "$target" == "$path" ]] && continue
+    if path_is_under "$path" "$target"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+filter_acl_paths_on_device() {
+  local expected_dev="$1" entry entry_dev
+  while IFS= read -r -d '' entry; do
+    entry_dev=$(stat -Lc '%d' -- "$entry") || return 1
+    if [[ "$entry_dev" == "$expected_dev" ]]; then
+      printf '%s\0' "$entry"
+    fi
+  done
+  return 0
+}
+
+apply_acl_batch_on_device() {
+  local path="$1" expected_dev="$2" file_type="$3" acl_spec="$4" tmp
+  tmp=$(mktemp) || return 1
+  cleanup_files+=("$tmp")
+  if ! find "$path" -xdev -type "$file_type" -print0 2>/dev/null \
+      | filter_acl_paths_on_device "$expected_dev" >"$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  if ! xargs -0 -r setfacl -m "$acl_spec" -- <"$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  rm -f -- "$tmp"
+}
+
 apply_acl_to_path() {
-  local bind_base="$1" path="$2" uid="$3" recursive="$4"
+  local bind_base="$1" path="$2" uid="$3" recursive="$4" start_dev nested_status
+  if (( recursive == 1 )); then
+    start_dev=$(stat -Lc '%d' -- "$path") || return 1
+    if path_has_nested_mounts "$path"; then
+      # Refuse the recursive operation altogether rather than touching a child
+      # mount root. The caller warns and leaves existing permissions in place.
+      return 1
+    else
+      nested_status=$?
+      (( nested_status == 1 )) || return 1
+    fi
+  fi
+
   grant_traverse_acl "$bind_base" "$path" "$uid" || return 1
   setfacl -m "u:${uid}:rwx,d:u:${uid}:rwx" -- "$path" || return 1
 
   if (( recursive == 1 )); then
-    find "$path" -type d -print0 2>/dev/null | xargs -0 -r setfacl -m "u:${uid}:rwx,d:u:${uid}:rwx" --
-    find "$path" -type f -print0 2>/dev/null | xargs -0 -r setfacl -m "u:${uid}:rw" --
+    apply_acl_batch_on_device "$path" "$start_dev" d "u:${uid}:rwx,d:u:${uid}:rwx" || return 1
+    apply_acl_batch_on_device "$path" "$start_dev" f "u:${uid}:rw" || return 1
   fi
 }
 
@@ -768,6 +988,11 @@ CURRENT_LINK="$INSTALL_ROOT/current"
 DATA_DIR="/var/lib/bindery"
 BACKUP_ROOT="/var/backups/bindery"
 ENV_FILE="/etc/bindery/bindery.env"
+LOCK_FILE="/run/lock/bindery-maintenance.lock"
+FAIL_STATE_ROOT="/var/lib/bindery-maintenance"
+FAIL_SENTINEL="$FAIL_STATE_ROOT/rollback-failed"
+FAIL_DROPIN_DIR="/etc/systemd/system/bindery.service.d"
+FAIL_DROPIN="$FAIL_DROPIN_DIR/90-rollback-failed.conf"
 KEEP_RELEASES=4
 KEEP_BACKUPS=6
 
@@ -783,6 +1008,20 @@ if [[ ${EUID} -ne 0 ]]; then
   exit 1
 fi
 
+umask 0077
+install -d -m 0755 "$INSTALL_ROOT" "$RELEASE_ROOT"
+install -d -m 0700 "$BACKUP_ROOT"
+install -d -o bindery -g bindery -m 0750 "$DATA_DIR"
+
+# Updating and backing up both stop Bindery and snapshot mutable state. Keep
+# those operations mutually exclusive so neither can capture a half-restore.
+exec 9<>"$LOCK_FILE"
+chmod 0600 "$LOCK_FILE"
+if ! flock -n 9; then
+  echo "Another Bindery update or backup is already running." >&2
+  exit 1
+fi
+
 case "$(uname -m)" in
   x86_64) ARCH="amd64" ;;
   aarch64|arm64) ARCH="arm64" ;;
@@ -791,8 +1030,6 @@ case "$(uname -m)" in
   *) echo "Unsupported architecture: $(uname -m)"; exit 1 ;;
 esac
 
-mkdir -p "$RELEASE_ROOT" "$BACKUP_ROOT" "$DATA_DIR"
-
 echo "[Bindery] Checking GitHub for the latest release..."
 JSON=$(curl -fsSL --retry 3 --connect-timeout 10 \
   -H 'Accept: application/vnd.github+json' \
@@ -800,6 +1037,10 @@ JSON=$(curl -fsSL --retry 3 --connect-timeout 10 \
   "https://api.github.com/repos/${REPO}/releases/latest")
 TAG=$(jq -r '.tag_name // empty' <<<"$JSON")
 [[ -n "$TAG" ]] || { echo "Unable to determine latest release."; exit 1; }
+[[ "$TAG" =~ ^v?[[:alnum:]][[:alnum:].+_-]*$ ]] || {
+  echo "Refusing unsafe release tag: $TAG" >&2
+  exit 1
+}
 VERSION="${TAG#v}"
 TARGET="$RELEASE_ROOT/$TAG"
 
@@ -808,6 +1049,11 @@ PREVIOUS_TARGET=""
 if [[ -L "$CURRENT_LINK" ]]; then
   PREVIOUS_TARGET=$(readlink -f "$CURRENT_LINK")
   CURRENT_VERSION=$(basename "$PREVIOUS_TARGET")
+fi
+
+if (( INSTALL_ONLY == 1 )) && [[ -n "$PREVIOUS_TARGET" ]]; then
+  echo "--install is only valid for a fresh installation." >&2
+  exit 2
 fi
 
 if [[ "$CURRENT_VERSION" == "$TAG" ]]; then
@@ -822,8 +1068,30 @@ CHECKSUM_URL=$(jq -r --arg n "$CHECKSUM_NAME" '.assets[] | select(.name==$n) | .
 [[ -n "$ARCHIVE_URL" && "$ARCHIVE_URL" != "null" ]] || { echo "Release asset not found: $ARCHIVE_NAME"; exit 1; }
 [[ -n "$CHECKSUM_URL" && "$CHECKSUM_URL" != "null" ]] || { echo "Checksum asset not found: $CHECKSUM_NAME"; exit 1; }
 
-TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
+TMP=$(mktemp -d /tmp/bindery-update.XXXXXX)
+BACKUP=""
+BACKUP_TMP=""
+RESTORE_STAGE=""
+RESTORE_OLD=""
+VERIFY_UNIT=""
+VERIFY_UNIT_FILE=""
+
+cleanup_update() {
+  local ec=$?
+  trap - EXIT
+  if [[ -n "${VERIFY_UNIT:-}" ]]; then
+    systemctl stop "$VERIFY_UNIT" >/dev/null 2>&1 || true
+  fi
+  [[ -z "${VERIFY_UNIT_FILE:-}" ]] || rm -f -- "$VERIFY_UNIT_FILE" || true
+  if [[ -n "${VERIFY_UNIT:-}" ]]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+  [[ -z "${BACKUP_TMP:-}" ]] || rm -f -- "$BACKUP_TMP" || true
+  [[ -z "${RESTORE_STAGE:-}" ]] || rm -rf -- "$RESTORE_STAGE" || true
+  rm -rf -- "$TMP" || true
+  exit "$ec"
+}
+trap cleanup_update EXIT
 
 echo "[Bindery] Downloading $TAG for linux/$ARCH..."
 curl -fL --retry 3 "$ARCHIVE_URL" -o "$TMP/$ARCHIVE_NAME"
@@ -840,32 +1108,31 @@ ACTUAL=$(sha256sum "$TMP/$ARCHIVE_NAME" | awk '{print $1}')
 [[ "$EXPECTED" == "$ACTUAL" ]] || { echo "SHA-256 verification FAILED."; exit 1; }
 echo "[Bindery] SHA-256 verified."
 
-rm -rf "$TARGET.new"
-mkdir -p "$TARGET.new"
-tar -xzf "$TMP/$ARCHIVE_NAME" -C "$TARGET.new"
-[[ -x "$TARGET.new/bindery" || -f "$TARGET.new/bindery" ]] || {
-  found=$(find "$TARGET.new" -maxdepth 3 -type f -name bindery | head -n1)
+RELEASE_STAGE="$TARGET.new"
+rm -rf -- "$RELEASE_STAGE"
+install -d -m 0755 "$RELEASE_STAGE"
+tar -xzf "$TMP/$ARCHIVE_NAME" -C "$RELEASE_STAGE"
+[[ -x "$RELEASE_STAGE/bindery" || -f "$RELEASE_STAGE/bindery" ]] || {
+  found=$(find "$RELEASE_STAGE" -maxdepth 3 -type f -name bindery -print -quit)
   [[ -n "$found" ]] || { echo "Bindery binary not found in archive."; exit 1; }
-  cp -a "$found" "$TARGET.new/bindery"
+  cp -a "$found" "$RELEASE_STAGE/bindery"
 }
-chmod 0755 "$TARGET.new/bindery"
-rm -rf "$TARGET"
-mv "$TARGET.new" "$TARGET"
-
-if (( INSTALL_ONLY == 1 )) && [[ -n "$PREVIOUS_TARGET" ]]; then
-  echo "--install is only valid for a fresh installation." >&2
-  exit 2
-fi
+chmod 0755 "$RELEASE_STAGE" "$RELEASE_STAGE/bindery"
+rm -rf -- "$TARGET"
+mv -- "$RELEASE_STAGE" "$TARGET"
 
 if (( INSTALL_ONLY == 1 )) || [[ -z "$PREVIOUS_TARGET" ]]; then
   ln -sfn "$TARGET" "$CURRENT_LINK"
-  echo "$TAG" > /opt/bindery/VERSION
+  printf '%s\n' "$TAG" > /opt/bindery/VERSION
+  chmod 0644 /opt/bindery/VERSION
   echo "[Bindery] Installed $TAG."
   exit 0
 fi
 
-BACKUP="$BACKUP_ROOT/pre-${TAG}-$(date +%Y%m%d-%H%M%S).tar.gz"
-SERVICE_STOPPED=0
+SAFE_TAG=${TAG//[^[:alnum:]._-]/_}
+SERVICE_WAS_ACTIVE=0
+SERVICE_WAS_ENABLED=0
+MAINTENANCE_STARTED=0
 SWITCHED=0
 BACKUP_READY=0
 
@@ -873,85 +1140,382 @@ BACKUP_READY=0
 # systemd EnvironmentFile as shell code: valid media paths can contain shell
 # metacharacters and systemd's quoting rules are not Bash's quoting rules.
 HEALTH_PORT=8787
+HEALTH_URL_BASE=""
 if [[ -f "$ENV_FILE" ]]; then
-  configured_port=$(sed -nE 's/^BINDERY_PORT="?([0-9]+)"?[[:space:]]*$/\1/p' "$ENV_FILE" | head -n1)
+  configured_port=$(sed -nE 's/^BINDERY_PORT="?([0-9]+)"?[[:space:]]*$/\1/p' "$ENV_FILE")
+  configured_port=${configured_port%%$'\n'*}
   if [[ "$configured_port" =~ ^[0-9]+$ ]] && (( configured_port >= 1 && configured_port <= 65535 )); then
     HEALTH_PORT="$configured_port"
   fi
+  configured_url_base=$(sed -nE 's/^BINDERY_URL_BASE="?([^"[:space:]]*)"?[[:space:]]*$/\1/p' "$ENV_FILE")
+  configured_url_base=${configured_url_base%%$'\n'*}
+  if [[ -n "$configured_url_base" && "$configured_url_base" == /* ]]; then
+    HEALTH_URL_BASE="$configured_url_base"
+    while [[ "$HEALTH_URL_BASE" == */ ]]; do
+      HEALTH_URL_BASE=${HEALTH_URL_BASE%/}
+    done
+  fi
 fi
+
+bindery_endpoint_is_healthy() {
+  local status
+  status=$(curl -sS --connect-timeout 2 --max-time 5 \
+    --output /dev/null --write-out '%{http_code}' \
+    "http://127.0.0.1:${HEALTH_PORT}${HEALTH_URL_BASE}/api/v1/health" \
+    2>/dev/null) || return 1
+  [[ "$status" == "200" ]]
+}
 
 bindery_is_healthy() {
   systemctl is-active --quiet bindery \
-    && runuser -u bindery -- env BINDERY_PORT="$HEALTH_PORT" \
-      "$CURRENT_LINK/bindery" healthcheck >/dev/null 2>&1
+    && bindery_endpoint_is_healthy
+}
+
+arm_fail_closed() {
+  local reason=$1
+  local active_state="" marker_tmp="" dropin_tmp="" failed=0
+
+  systemctl stop bindery >/dev/null 2>&1 || failed=1
+  if active_state=$(systemctl show bindery.service --property=ActiveState --value 2>/dev/null); then
+    [[ "$active_state" == "inactive" || "$active_state" == "failed" ]] || failed=1
+  else
+    failed=1
+  fi
+  # Disable first. Even if power is lost while the remaining guard files are
+  # being installed, the failed release cannot be activated automatically.
+  systemctl disable bindery.service >/dev/null 2>&1 || failed=1
+  sync -f /etc/systemd/system >/dev/null 2>&1 || failed=1
+
+  # The runtime mask prevents an accidental start now. The persistent marker
+  # and condition keep the unit fail-closed after a reboot, while disable
+  # removes its normal boot-time activation symlink.
+  if install -d -m 0755 "$FAIL_DROPIN_DIR"; then
+    if dropin_tmp=$(mktemp "$FAIL_DROPIN_DIR/.rollback-failed.XXXXXX"); then
+      if printf '[Unit]\nConditionPathExists=!%s\n' "$FAIL_SENTINEL" >"$dropin_tmp"; then
+        if chmod 0644 "$dropin_tmp" \
+            && mv -f -- "$dropin_tmp" "$FAIL_DROPIN" \
+            && sync -f "$FAIL_DROPIN" >/dev/null 2>&1; then
+          dropin_tmp=""
+        else
+          failed=1
+        fi
+      else
+        failed=1
+      fi
+      [[ -z "$dropin_tmp" ]] || rm -f -- "$dropin_tmp" || true
+    else
+      failed=1
+    fi
+  else
+    failed=1
+  fi
+
+  # Publish the marker only after the condition that consumes it is durable.
+  if install -d -m 0700 "$FAIL_STATE_ROOT"; then
+    if marker_tmp=$(mktemp "$FAIL_STATE_ROOT/.rollback-failed.XXXXXX"); then
+      if printf '%s\nBackup: %s\nPreserved data: %s\n' \
+          "$reason" "${BACKUP:-unavailable}" "${RESTORE_OLD:-unavailable}" >"$marker_tmp" \
+          && chmod 0600 "$marker_tmp" \
+          && mv -f -- "$marker_tmp" "$FAIL_SENTINEL" \
+          && sync -f "$FAIL_SENTINEL" >/dev/null 2>&1; then
+        marker_tmp=""
+      else
+        failed=1
+      fi
+      [[ -z "$marker_tmp" ]] || rm -f -- "$marker_tmp" || true
+    else
+      failed=1
+    fi
+  else
+    failed=1
+  fi
+
+  [[ -f "$FAIL_DROPIN" && ! -L "$FAIL_DROPIN" ]] || failed=1
+  [[ -f "$FAIL_SENTINEL" && ! -L "$FAIL_SENTINEL" ]] || failed=1
+  systemctl daemon-reload >/dev/null 2>&1 || failed=1
+  systemctl mask --runtime bindery.service >/dev/null 2>&1 || failed=1
+
+  (( failed == 0 ))
+}
+
+persist_fail_closed() {
+  local reason=$1
+  if ! arm_fail_closed "$reason"; then
+    echo "[Bindery] WARNING: the persistent recovery guard could not be fully installed." >&2
+  fi
+
+  echo "[Bindery] CRITICAL: $reason" >&2
+  echo "[Bindery] Bindery is disabled and masked; recovery details: $FAIL_SENTINEL" >&2
+}
+
+clear_fail_closed() {
+  rm -f -- "$FAIL_SENTINEL" "$FAIL_DROPIN" || return 1
+  systemctl unmask --runtime bindery.service >/dev/null 2>&1 || return 1
+  systemctl daemon-reload >/dev/null 2>&1 || return 1
+  if (( SERVICE_WAS_ENABLED == 1 )); then
+    systemctl enable bindery.service >/dev/null 2>&1 || return 1
+  else
+    systemctl disable bindery.service >/dev/null 2>&1 || return 1
+  fi
+}
+
+verify_guarded_rollback() {
+  local healthy=0 cleanup_failed=0
+  VERIFY_UNIT="bindery-rollback-verify-$$.service"
+  VERIFY_UNIT_FILE="/run/systemd/system/$VERIFY_UNIT"
+
+  if ! printf '%s\n' \
+      '[Unit]' \
+      'Description=Temporary Bindery rollback verification' \
+      '[Service]' \
+      'Type=simple' \
+      'User=bindery' \
+      'Group=bindery' \
+      "EnvironmentFile=$ENV_FILE" \
+      "WorkingDirectory=$DATA_DIR" \
+      "ExecStart=$CURRENT_LINK/bindery" \
+      'Restart=no' \
+      'TimeoutStopSec=45' >"$VERIFY_UNIT_FILE"; then
+    return 1
+  fi
+  chmod 0644 "$VERIFY_UNIT_FILE" || return 1
+  systemctl daemon-reload >/dev/null 2>&1 || return 1
+
+  if systemctl start "$VERIFY_UNIT"; then
+    for _ in $(seq 1 20); do
+      if systemctl is-active --quiet "$VERIFY_UNIT" && bindery_endpoint_is_healthy; then
+        healthy=1
+        break
+      fi
+      sleep 1
+    done
+  fi
+
+  if ! systemctl stop "$VERIFY_UNIT" >/dev/null 2>&1; then
+    cleanup_failed=1
+  fi
+  if ! rm -f -- "$VERIFY_UNIT_FILE"; then
+    cleanup_failed=1
+  fi
+  if ! systemctl daemon-reload >/dev/null 2>&1; then
+    cleanup_failed=1
+  fi
+  VERIFY_UNIT=""
+  VERIFY_UNIT_FILE=""
+
+  (( healthy == 1 && cleanup_failed == 0 ))
 }
 
 restore_previous() {
-  trap - ERR
-  local failed=0
+  local data_parent restore_old_template
+  local quick_check="" reason="" rollback_healthy=0
   echo "[Bindery] Restoring $CURRENT_VERSION..." >&2
   systemctl stop bindery >/dev/null 2>&1 || true
 
-  # Restore data first. If this fails, fail closed: do not start either binary
-  # against a database whose migration state is unknown.
-  if (( BACKUP_READY == 1 )); then
-    find "$DATA_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + || failed=1
-    if (( failed == 0 )); then
-      tar -C "$DATA_DIR" -xzf "$BACKUP" || failed=1
-    fi
-  fi
-
-  if (( failed == 0 )); then
-    ln -sfn "$PREVIOUS_TARGET" "$CURRENT_LINK" || failed=1
-    echo "$CURRENT_VERSION" > /opt/bindery/VERSION || failed=1
-  fi
-
-  if (( failed != 0 )); then
-    echo "[Bindery] CRITICAL: rollback restore failed; Bindery has been left STOPPED to protect its data." >&2
-    echo "[Bindery] Backup: $BACKUP" >&2
+  if (( BACKUP_READY != 1 )) || [[ ! -f "$BACKUP" ]]; then
+    reason="Rollback backup is not available; live data was not replaced."
+    persist_fail_closed "$reason"
     return 1
   fi
 
-  systemctl start bindery || true
-  for _ in $(seq 1 20); do
-    if bindery_is_healthy; then
-      echo "[Bindery] Rollback to $CURRENT_VERSION completed." >&2
-      return 0
+  # Validate and extract away from the live directory. A corrupt archive can
+  # therefore never destroy the only live copy before recovery is known-good.
+  if ! tar -tzf "$BACKUP" >/dev/null; then
+    reason="Rollback archive validation failed; live data was not replaced."
+    persist_fail_closed "$reason"
+    return 1
+  fi
+
+  data_parent=$(dirname "$DATA_DIR")
+  if ! RESTORE_STAGE=$(mktemp -d "$data_parent/.bindery-restore.XXXXXX"); then
+    reason="Could not create a rollback staging directory; live data was not replaced."
+    persist_fail_closed "$reason"
+    return 1
+  fi
+  if ! chmod 0750 "$RESTORE_STAGE"; then
+    reason="Could not secure the rollback staging directory; live data was not replaced."
+    persist_fail_closed "$reason"
+    return 1
+  fi
+  if ! tar --extract --gzip --file="$BACKUP" --directory="$RESTORE_STAGE" --no-same-owner; then
+    reason="Rollback archive extraction failed; live data was not replaced."
+    persist_fail_closed "$reason"
+    return 1
+  fi
+  if [[ -e "$RESTORE_STAGE/bindery.db" ]]; then
+    if [[ ! -f "$RESTORE_STAGE/bindery.db" || -L "$RESTORE_STAGE/bindery.db" ]]; then
+      reason="The staged Bindery database is not a regular file; live data was not replaced."
+      persist_fail_closed "$reason"
+      return 1
     fi
-    sleep 1
-  done
-  systemctl stop bindery >/dev/null 2>&1 || true
-  echo "[Bindery] Rollback service did not become healthy and has been left STOPPED. Check: journalctl -u bindery -n 100" >&2
-  return 1
+    if ! quick_check=$(sqlite3 -batch "$RESTORE_STAGE/bindery.db" 'PRAGMA quick_check;' 2>&1) \
+        || [[ "$quick_check" != "ok" ]]; then
+      reason="SQLite quick_check rejected the staged Bindery database; live data was not replaced."
+      persist_fail_closed "$reason"
+      return 1
+    fi
+  fi
+  if ! chown -R -- bindery:bindery "$RESTORE_STAGE" || ! chmod 0750 "$RESTORE_STAGE"; then
+    reason="Rollback staging permissions could not be secured; live data was not replaced."
+    persist_fail_closed "$reason"
+    return 1
+  fi
+
+  if ! restore_old_template=$(mktemp -d "$data_parent/.bindery-pre-rollback.XXXXXX"); then
+    reason="Could not reserve a path for the migrated live data."
+    persist_fail_closed "$reason"
+    return 1
+  fi
+  if ! rmdir -- "$restore_old_template"; then
+    reason="Could not prepare the path that preserves migrated live data."
+    persist_fail_closed "$reason"
+    return 1
+  fi
+  RESTORE_OLD="$restore_old_template"
+
+  # Establish the reboot-persistent guard before the first rename. The normal
+  # unit remains disabled and masked until the restored binary and data have
+  # passed a health probe under a temporary verification unit.
+  if ! arm_fail_closed "Rollback transaction in progress; verification has not completed."; then
+    reason="Could not establish the persistent rollback guard; live data was not replaced."
+    persist_fail_closed "$reason"
+    return 1
+  fi
+  if ! mv -- "$DATA_DIR" "$RESTORE_OLD"; then
+    reason="Could not preserve the migrated live data before rollback."
+    persist_fail_closed "$reason"
+    return 1
+  fi
+  if ! mv -- "$RESTORE_STAGE" "$DATA_DIR"; then
+    mv -- "$RESTORE_OLD" "$DATA_DIR" >/dev/null 2>&1 || true
+    reason="Could not activate staged rollback data; the migrated data was preserved."
+    persist_fail_closed "$reason"
+    return 1
+  fi
+  RESTORE_STAGE=""
+
+  if ! ln -sfn "$PREVIOUS_TARGET" "$CURRENT_LINK" \
+      || ! printf '%s\n' "$CURRENT_VERSION" > /opt/bindery/VERSION \
+      || ! chmod 0644 /opt/bindery/VERSION; then
+    reason="Restored data could not be paired with the previous Bindery release."
+    persist_fail_closed "$reason"
+    return 1
+  fi
+
+  if ! verify_guarded_rollback; then
+    reason="The restored release and data did not pass guarded health verification."
+    persist_fail_closed "$reason"
+    return 1
+  fi
+
+  # It is now safe for the ordinary unit to start after a reboot.
+  if ! clear_fail_closed; then
+    reason="Rollback verified, but the persistent recovery guard could not be cleared."
+    persist_fail_closed "$reason"
+    return 1
+  fi
+
+  if (( SERVICE_WAS_ACTIVE == 1 )); then
+    systemctl start bindery || true
+    for _ in $(seq 1 20); do
+      if bindery_is_healthy; then
+        rollback_healthy=1
+        break
+      fi
+      sleep 1
+    done
+    if (( rollback_healthy == 0 )); then
+      reason="The normal Bindery service failed after guarded rollback verification."
+      persist_fail_closed "$reason"
+      return 1
+    fi
+  else
+    systemctl stop bindery >/dev/null 2>&1 || true
+  fi
+
+  if ! rm -rf -- "$RESTORE_OLD"; then
+    echo "[Bindery] Warning: preserved migrated data remains at $RESTORE_OLD" >&2
+  else
+    RESTORE_OLD=""
+  fi
+  echo "[Bindery] Rollback to $CURRENT_VERSION completed." >&2
+  return 0
+}
+
+restore_unswitched_state() {
+  if (( SERVICE_WAS_ACTIVE == 1 )); then
+    if ! systemctl start bindery; then
+      persist_fail_closed "The previous release could not be restarted after an interrupted update."
+      return 1
+    fi
+  else
+    systemctl stop bindery >/dev/null 2>&1 || true
+  fi
+}
+
+recover_after_abort() {
+  if (( SWITCHED == 1 )); then
+    restore_previous || true
+  elif (( MAINTENANCE_STARTED == 1 )); then
+    restore_unswitched_state || true
+  fi
 }
 
 update_error() {
   local ec=$?
   trap - ERR
-  echo "[Bindery] Update interrupted (exit $ec). Recovering the previous service state..." >&2
-  if (( SWITCHED == 1 )); then
-    restore_previous || true
-  elif (( SERVICE_STOPPED == 1 )); then
-    # No binary switch occurred. Restart the known-good service; a partial
-    # backup archive, if any, is not used for recovery.
-    [[ -f "$BACKUP" && $BACKUP_READY -eq 0 ]] && rm -f -- "$BACKUP" || true
-    systemctl start bindery || true
-  fi
+  trap '' INT TERM HUP
+  echo "[Bindery] Update failed (exit $ec). Recovering the previous service state..." >&2
+  recover_after_abort
   exit "$ec"
 }
+
+update_signal() {
+  local signal=$1 ec=1
+  case "$signal" in
+    HUP) ec=129 ;;
+    INT) ec=130 ;;
+    TERM) ec=143 ;;
+  esac
+  trap - ERR
+  trap '' INT TERM HUP
+  echo "[Bindery] Update received $signal. Recovering the previous service state..." >&2
+  recover_after_abort
+  exit "$ec"
+}
+
 trap update_error ERR
+trap 'update_signal HUP' HUP
+trap 'update_signal INT' INT
+trap 'update_signal TERM' TERM
+
+if systemctl is-active --quiet bindery; then
+  SERVICE_WAS_ACTIVE=1
+fi
+if systemctl is-enabled --quiet bindery.service; then
+  SERVICE_WAS_ENABLED=1
+fi
 
 echo "[Bindery] Stopping service cleanly..."
+MAINTENANCE_STARTED=1
 systemctl stop bindery
-SERVICE_STOPPED=1
 
+backup_stamp=$(date +%Y%m%d-%H%M%S)
+BACKUP_TMP=$(mktemp "$BACKUP_ROOT/.pre-${SAFE_TAG}-${backup_stamp}.XXXXXX")
+backup_tmp_name=${BACKUP_TMP##*/}
+BACKUP="$BACKUP_ROOT/${backup_tmp_name#.}.tar.gz"
 echo "[Bindery] Backing up application data to $BACKUP"
-tar -C "$DATA_DIR" -czf "$BACKUP" .
+tar -C "$DATA_DIR" -czf "$BACKUP_TMP" .
+tar -tzf "$BACKUP_TMP" >/dev/null
+chmod 0600 "$BACKUP_TMP"
+mv -- "$BACKUP_TMP" "$BACKUP"
+BACKUP_TMP=""
 BACKUP_READY=1
 
-ln -sfn "$TARGET" "$CURRENT_LINK"
 SWITCHED=1
-echo "$TAG" > /opt/bindery/VERSION
+ln -sfn "$TARGET" "$CURRENT_LINK"
+printf '%s\n' "$TAG" > /opt/bindery/VERSION
+chmod 0644 /opt/bindery/VERSION
 # A failed start is handled by the health loop and rollback below.
 systemctl start bindery || true
 
@@ -965,13 +1529,19 @@ for _ in $(seq 1 30); do
 done
 
 if (( healthy == 1 )); then
-  SERVICE_STOPPED=0
-  trap - ERR
+  if (( SERVICE_WAS_ACTIVE == 0 )); then
+    systemctl stop bindery
+  fi
+  MAINTENANCE_STARTED=0
+  trap - ERR INT TERM HUP
   echo "[Bindery] Updated successfully: $CURRENT_VERSION -> $TAG"
 else
   echo "[Bindery] New release failed Bindery's built-in healthcheck. Rolling back binary AND data..." >&2
   trap - ERR
-  restore_previous || true
+  trap '' INT TERM HUP
+  if ! restore_previous; then
+    exit 1
+  fi
   exit 1
 fi
 
@@ -996,17 +1566,72 @@ UPDATER_EOF
 #!/usr/bin/env bash
 set -Eeuo pipefail
 [[ ${EUID} -eq 0 ]] || { echo "Run as root."; exit 1; }
-DEST="/var/backups/bindery/manual-$(date +%Y%m%d-%H%M%S).tar.gz"
-mkdir -p /var/backups/bindery
-systemctl stop bindery
-trap 'systemctl start bindery >/dev/null 2>&1 || true' EXIT
-tar -C / -czf "$DEST" \
+
+BACKUP_ROOT="/var/backups/bindery"
+LOCK_FILE="/run/lock/bindery-maintenance.lock"
+umask 0077
+install -d -m 0700 "$BACKUP_ROOT"
+
+exec 9<>"$LOCK_FILE"
+chmod 0600 "$LOCK_FILE"
+if ! flock -n 9; then
+  echo "Another Bindery update or backup is already running." >&2
+  exit 1
+fi
+
+archive_stamp=$(date +%Y%m%d-%H%M%S)
+TMP_ARCHIVE=$(mktemp "$BACKUP_ROOT/.manual-${archive_stamp}.XXXXXX")
+tmp_name=${TMP_ARCHIVE##*/}
+DEST="$BACKUP_ROOT/${tmp_name#.}.tar.gz"
+SERVICE_WAS_ACTIVE=0
+if systemctl is-active --quiet bindery; then
+  SERVICE_WAS_ACTIVE=1
+fi
+
+backup_cleanup() {
+  local ec=$?
+  trap - EXIT
+  trap '' INT TERM HUP
+  [[ -z "${TMP_ARCHIVE:-}" ]] || rm -f -- "$TMP_ARCHIVE" || true
+  if (( SERVICE_WAS_ACTIVE == 1 )); then
+    systemctl start bindery >/dev/null 2>&1 || \
+      echo "Bindery could not be restarted; inspect journalctl -u bindery -n 100." >&2
+  fi
+  exit "$ec"
+}
+
+backup_signal() {
+  local signal=$1 ec=1
+  case "$signal" in
+    HUP) ec=129 ;;
+    INT) ec=130 ;;
+    TERM) ec=143 ;;
+  esac
+  exit "$ec"
+}
+
+trap backup_cleanup EXIT
+trap 'backup_signal HUP' HUP
+trap 'backup_signal INT' INT
+trap 'backup_signal TERM' TERM
+
+if (( SERVICE_WAS_ACTIVE == 1 )); then
+  systemctl stop bindery
+fi
+tar -C / -czf "$TMP_ARCHIVE" \
   var/lib/bindery \
   etc/bindery \
   etc/systemd/system/bindery.service \
   opt/bindery/VERSION 2>/dev/null
-systemctl start bindery
-trap - EXIT
+tar -tzf "$TMP_ARCHIVE" >/dev/null
+chmod 0600 "$TMP_ARCHIVE"
+mv -- "$TMP_ARCHIVE" "$DEST"
+TMP_ARCHIVE=""
+
+if (( SERVICE_WAS_ACTIVE == 1 )); then
+  systemctl start bindery
+  SERVICE_WAS_ACTIVE=0
+fi
 echo "$DEST"
 BACKUP_EOF
 
@@ -1128,16 +1753,18 @@ systemd_env_escape() {
 }
 
 make_env_file() {
-  local remap_line=""
+  local remap_line="" telemetry_value="true"
   if [[ -n "$DOWNLOAD_PATH_REMAP" ]]; then
     remap_line="BINDERY_DOWNLOAD_PATH_REMAP=\"$(systemd_env_escape "$DOWNLOAD_PATH_REMAP")\""
   fi
+  (( TELEMETRY_DISABLED == 0 )) && telemetry_value="false"
 
   cat >"$INNER_DIR/bindery.env" <<EOF
 BINDERY_PORT="$DEFAULT_PORT"
 BINDERY_DATA_DIR="/var/lib/bindery"
 BINDERY_DB_PATH="/var/lib/bindery/bindery.db"
 BINDERY_LOG_LEVEL="info"
+BINDERY_TELEMETRY_DISABLED="$telemetry_value"
 BINDERY_DOWNLOAD_DIR="$(systemd_env_escape "$DOWNLOAD_CT")"
 BINDERY_AUDIOBOOK_DOWNLOAD_DIR="$(systemd_env_escape "$DOWNLOAD_CT")"
 BINDERY_LIBRARY_DIR="$(systemd_env_escape "$LIBRARY_CT")"
@@ -1146,6 +1773,131 @@ BINDERY_PUID="$BINDERY_UID"
 BINDERY_PGID="$BINDERY_GID"
 ${remap_line}
 EOF
+}
+
+# Install a host-side LXC pre-start hook. Unlike the one-time check during the
+# wizard, this guard runs for manual starts, restarts, and onboot starts. It
+# refuses to expose an underlying directory if a selected disk/network mount is
+# absent, replaced, or shadowed by a nested mount.
+install_media_mount_guard() {
+  local guard_dir="/usr/local/libexec/bindery-lxc"
+  local guard_path="$guard_dir/media-mount-guard-$CTID.sh"
+  local config_path="/etc/pve/lxc/$CTID.conf"
+  local -a guard_labels guard_paths guard_targets guard_sources guard_fstypes guard_uuids
+  local -a candidate_labels candidate_paths
+  local candidate_index candidate_path existing_path duplicate
+
+  if [[ "$MEDIA_LAYOUT" == "single" ]]; then
+    # The common base proves that the selected filesystem is still mounted,
+    # while both leaves prove that no later nested/replacement mount shadows a
+    # selected folder. Deduplicate paths when a leaf is also the common base.
+    candidate_labels=("combined media base" "downloads" "audiobooks")
+    candidate_paths=("$MEDIA_HOST_BASE" "$DOWNLOAD_PATH" "$AUDIOBOOK_PATH")
+    for candidate_index in "${!candidate_paths[@]}"; do
+      candidate_path=${candidate_paths[$candidate_index]}
+      duplicate=0
+      for existing_path in "${guard_paths[@]}"; do
+        if [[ "$existing_path" == "$candidate_path" ]]; then
+          duplicate=1
+          break
+        fi
+      done
+      (( duplicate == 1 )) && continue
+      guard_labels+=("${candidate_labels[$candidate_index]}")
+      guard_paths+=("$candidate_path")
+      guard_targets+=("$DOWNLOAD_MOUNT_TARGET")
+      guard_sources+=("$DOWNLOAD_MOUNT_SOURCE")
+      guard_fstypes+=("$DOWNLOAD_MOUNT_FSTYPE")
+      guard_uuids+=("$DOWNLOAD_MOUNT_UUID")
+    done
+  else
+    guard_labels=("downloads" "audiobooks")
+    guard_paths=("$DOWNLOAD_PATH" "$AUDIOBOOK_PATH")
+    guard_targets=("$DOWNLOAD_MOUNT_TARGET" "$AUDIOBOOK_MOUNT_TARGET")
+    guard_sources=("$DOWNLOAD_MOUNT_SOURCE" "$AUDIOBOOK_MOUNT_SOURCE")
+    guard_fstypes=("$DOWNLOAD_MOUNT_FSTYPE" "$AUDIOBOOK_MOUNT_FSTYPE")
+    guard_uuids=("$DOWNLOAD_MOUNT_UUID" "$AUDIOBOOK_MOUNT_UUID")
+  fi
+
+  install -d -m 0755 -- "$guard_dir"
+  # Until the hook is fully written and referenced by the CT configuration it
+  # is temporary. The global EXIT trap removes it on an interrupted install.
+  cleanup_files+=("$guard_path")
+  {
+    printf '#!/bin/bash\nset -Eeuo pipefail\nPATH=/usr/sbin:/usr/bin:/sbin:/bin\n'
+    printf 'guard_labels=('; printf ' %q' "${guard_labels[@]}"; printf ' )\n'
+    printf 'guard_paths=('; printf ' %q' "${guard_paths[@]}"; printf ' )\n'
+    printf 'guard_targets=('; printf ' %q' "${guard_targets[@]}"; printf ' )\n'
+    printf 'guard_sources=('; printf ' %q' "${guard_sources[@]}"; printf ' )\n'
+    printf 'guard_fstypes=('; printf ' %q' "${guard_fstypes[@]}"; printf ' )\n'
+    printf 'guard_uuids=('; printf ' %q' "${guard_uuids[@]}"; printf ' )\n'
+    cat <<'GUARD'
+
+guard_load_identity() {
+  local path="$1" lookup="$2" json
+  if [[ "$lookup" == "mountpoint" ]]; then
+    json=$(findmnt -J -M "$path" -o ID,TARGET,SOURCE,FSTYPE,UUID 2>/dev/null) || return 1
+  else
+    json=$(findmnt -J -T "$path" -o ID,TARGET,SOURCE,FSTYPE,UUID 2>/dev/null) || return 1
+  fi
+  CURRENT_ID=$(jq -er '.filesystems[0].id | tostring' <<<"$json") || return 1
+  CURRENT_TARGET=$(jq -er '.filesystems[0].target' <<<"$json") || return 1
+  CURRENT_SOURCE=$(jq -er '.filesystems[0].source' <<<"$json") || return 1
+  CURRENT_FSTYPE=$(jq -er '.filesystems[0].fstype' <<<"$json") || return 1
+  CURRENT_UUID=$(jq -r '.filesystems[0].uuid // ""' <<<"$json") || return 1
+  CURRENT_TARGET=$(realpath -e -- "$CURRENT_TARGET" 2>/dev/null) || return 1
+}
+
+guard_fail() {
+  echo "[Bindery media guard] Refusing to start container ${LXC_NAME:-unknown}: $*" >&2
+  exit 1
+}
+
+for i in "${!guard_paths[@]}"; do
+  label=${guard_labels[$i]}
+  path=${guard_paths[$i]}
+  expected_target=${guard_targets[$i]}
+  expected_source=${guard_sources[$i]}
+  expected_fstype=${guard_fstypes[$i]}
+  expected_uuid=${guard_uuids[$i]}
+
+  [[ -d "$path" ]] || guard_fail "$label path is unavailable: $path"
+  canonical=$(realpath -e -- "$path" 2>/dev/null) || guard_fail "$label path cannot be resolved: $path"
+  [[ "$canonical" == "$path" ]] || guard_fail "$label path now contains a symlink: $path"
+
+  guard_load_identity "$expected_target" mountpoint \
+    || guard_fail "expected $label mount point is not mounted: $expected_target"
+  mount_id=$CURRENT_ID
+  mount_target=$CURRENT_TARGET
+  [[ "$mount_target" == "$expected_target" && "$CURRENT_FSTYPE" == "$expected_fstype" ]] \
+    || guard_fail "$label mount identity changed at $expected_target"
+  if [[ -n "$expected_uuid" ]]; then
+    [[ "$CURRENT_UUID" == "$expected_uuid" ]] \
+      || guard_fail "$label filesystem UUID changed at $expected_target"
+  else
+    [[ "$CURRENT_SOURCE" == "$expected_source" ]] \
+      || guard_fail "$label mount source changed at $expected_target"
+  fi
+
+  guard_load_identity "$path" target \
+    || guard_fail "$label path is not on a mounted filesystem: $path"
+  [[ "$CURRENT_ID" == "$mount_id" && "$CURRENT_TARGET" == "$mount_target" ]] \
+    || guard_fail "$label path is no longer on its selected mount: $path"
+done
+GUARD
+  } >"$guard_path"
+  chmod 0755 -- "$guard_path"
+
+  # Proxmox preserves low-level lxc.* entries and passes them to LXC. This hook
+  # lives on the host and aborts every start before the guest can access media.
+  printf 'lxc.hook.pre-start: %s\n' "$guard_path" >>"$config_path"
+  local -a remaining_cleanup=()
+  local cleanup_path
+  for cleanup_path in "${cleanup_files[@]:-}"; do
+    [[ "$cleanup_path" == "$guard_path" ]] || remaining_cleanup+=("$cleanup_path")
+  done
+  cleanup_files=("${remaining_cleanup[@]}")
+  MEDIA_MOUNT_GUARD_PATH="$guard_path"
 }
 
 # ---------- create LXC ----------
@@ -1161,7 +1913,12 @@ create_lxc() {
   else
     net0+=",ip=$IPV4_CIDR,gw=$GATEWAY"
   fi
-  net0+=",ip6=auto"
+  case "$IPV6_MODE" in
+    auto) net0+=",ip6=auto" ;;
+    dhcp) net0+=",ip6=dhcp" ;;
+    manual) net0+=",ip6=manual" ;;
+    *) msg_err "Unsupported IPv6 mode: $IPV6_MODE"; return 1 ;;
+  esac
 
   msg_info "Creating Debian 13 LXC $CTID"
   local create_args=(
@@ -1178,38 +1935,72 @@ create_lxc() {
     --tags "$TAGS"
   )
   [[ -n "$DNS" ]] && create_args+=(--nameserver "$DNS")
-  [[ -n "$ROOT_PASSWORD" ]] && create_args+=(--password "$ROOT_PASSWORD")
 
   pct create "${create_args[@]}"
   msg_ok "Created LXC $CTID"
 
+  # Re-resolve the exact kernel mount identities at the last possible moment.
+  # If a NAS/disk disappeared during CT creation, do not attach the underlying
+  # host directory in its place.
+  if ! revalidate_media_mounts; then
+    msg_err "A selected media mount changed or went offline before attachment. LXC $CTID was created without media mounts and was not started."
+    return 1
+  fi
   if [[ "$MEDIA_LAYOUT" == "single" ]]; then
-    pct set "$CTID" -mp0 "${MEDIA_HOST_BASE},mp=/data,backup=0" >/dev/null
+    pct set "$CTID" --mp0 "volume=${MEDIA_HOST_BASE},mp=/data,backup=0" >/dev/null
   else
-    pct set "$CTID" -mp0 "${DOWNLOAD_PATH},mp=/data/downloads,backup=0" >/dev/null
-    pct set "$CTID" -mp1 "${AUDIOBOOK_PATH},mp=/data/audiobooks,backup=0" >/dev/null
+    pct set "$CTID" --mp0 "volume=${DOWNLOAD_PATH},mp=/data/downloads,backup=0" >/dev/null
+    pct set "$CTID" --mp1 "volume=${AUDIOBOOK_PATH},mp=/data/audiobooks,backup=0" >/dev/null
   fi
   msg_ok "Attached media storage"
 
   pct set "$CTID" --description "Bindery audiobook/book manager - installed by Bindery LXC Helper" >/dev/null
 
+  install_media_mount_guard
+  revalidate_media_mounts || {
+    msg_err "A selected media mount changed before permission setup. LXC $CTID was not started."
+    return 1
+  }
   configure_host_permissions
 
   pct start "$CTID"
-  msg_info "Waiting for the container network to initialize"
-  local network_ok=0
-  for _ in $(seq 1 40); do
-    if pct exec "$CTID" -- ping -c1 -W1 1.1.1.1 >/dev/null 2>&1 || pct exec "$CTID" -- getent hosts github.com >/dev/null 2>&1; then
+
+  # Keep the password out of `pct create` and therefore out of the host process
+  # list. chpasswd receives it only over pct exec's standard input, before SSH
+  # is installed or password authentication is enabled.
+  if (( ENABLE_SSH == 1 )); then
+    if ! printf 'root:%s\n' "$ROOT_PASSWORD" | pct exec "$CTID" -- chpasswd; then
+      ROOT_PASSWORD=""
+      msg_err "Could not set the container root password. SSH was not installed."
+      return 1
+    fi
+    ROOT_PASSWORD=""
+  fi
+
+  msg_info "Waiting for container DNS and HTTPS access"
+  local network_ok=0 https_client_ready=0 attempt
+  for ((attempt=1; attempt<=20; attempt++)); do
+    if pct exec "$CTID" -- getent ahosts github.com >/dev/null 2>&1; then
+      if (( https_client_ready == 0 )); then
+        if pct exec "$CTID" -- bash -lc \
+          'apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ca-certificates curl >/dev/null' \
+          >/dev/null 2>&1; then
+          https_client_ready=1
+        fi
+      fi
+    fi
+    if (( https_client_ready == 1 )) \
+        && pct exec "$CTID" -- curl -fsSL --output /dev/null --connect-timeout 5 --max-time 15 https://api.github.com/ >/dev/null 2>&1; then
       network_ok=1
       break
     fi
-    sleep 1
+    sleep 2
   done
   if (( network_ok == 0 )); then
-    msg_warn "The LXC started, but internet/DNS is not ready. Enter it with 'pct enter $CTID' to check networking."
+    msg_warn "The LXC started, but DNS-verified HTTPS access is not ready. Enter it with 'pct enter $CTID' to check DNS, routing, and TLS."
     return 1
   fi
-  msg_ok "Container network is online"
+  msg_ok "Container DNS and HTTPS access are online"
 
   pct exec "$CTID" -- timedatectl set-timezone "$timezone" >/dev/null 2>&1 || true
 
@@ -1238,11 +2029,14 @@ create_lxc() {
   # Marker used by the host-side manage menu. Write it as data on the host and
   # push it into the CT; do not interpolate media paths into `bash -lc`.
   {
-    printf 'HELPER_VERSION=1\n'
+    printf 'HELPER_VERSION=2\n'
     printf 'PORT=%s\n' "$DEFAULT_PORT"
     printf 'DOWNLOAD_DIR=%s\n' "$DOWNLOAD_CT"
     printf 'AUDIOBOOK_DIR=%s\n' "$AUDIOBOOK_CT"
     printf 'MEDIA_LAYOUT=%s\n' "$MEDIA_LAYOUT"
+    printf 'MOUNT_GUARD=host-pre-start\n'
+    printf 'IPV6_MODE=%s\n' "$IPV6_MODE"
+    printf 'TELEMETRY_DISABLED=%s\n' "$TELEMETRY_DISABLED"
   } >"$INNER_DIR/bindery-helper.conf"
   pct push "$CTID" "$INNER_DIR/bindery-helper.conf" /etc/bindery-helper.conf -perms 0644
 
@@ -1397,6 +2191,7 @@ install_new() {
   else
     until advanced_settings; do :; done
   fi
+  select_ipv6_mode || return 0
 
   ROOTFS_STORAGE=$(select_rootfs_storage) || return 0
 
@@ -1409,6 +2204,7 @@ install_new() {
     fi
   done
   select_permission_mode || return 0
+  select_telemetry || return 0
 
   if summary_and_confirm; then
     create_lxc
