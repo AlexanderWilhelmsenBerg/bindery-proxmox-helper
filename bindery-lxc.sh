@@ -34,6 +34,7 @@ DEFAULT_PORT=8787
 DEFAULT_TAGS="media;books;bindery"
 BINDERY_UID=1000
 BINDERY_GID=1000
+TEMPLATE_ARCH=""
 
 # ---------- UI ----------
 RED='\033[0;31m'
@@ -697,7 +698,13 @@ advanced_settings() {
   if wt_yesno "Container Security" "Use an UNPRIVILEGED LXC?\n\nRecommended for most setups. Choose No only if your media-storage permissions require a privileged container."; then
     UNPRIVILEGED=1
   else
-    UNPRIVILEGED=0
+    if wt_yesno "Privileged Container Warning" \
+      "Debian 13 systemd service isolation requires the LXC nesting feature. Combining nesting with a PRIVILEGED container substantially weakens containment.\n\nContinue only if unprivileged UID mapping cannot work with your storage." 18 92; then
+      UNPRIVILEGED=0
+    else
+      UNPRIVILEGED=1
+      wt_msg "Using Unprivileged LXC" "The safer unprivileged container mode remains selected."
+    fi
   fi
 
   if wt_yesno "SSH Server" "Install OpenSSH server inside the LXC?\n\nYou can always use 'pct enter $CTID' from the Proxmox host without SSH."; then
@@ -716,27 +723,32 @@ advanced_settings() {
 }
 
 select_permission_mode() {
-  local mapped_uid
-  if (( UNPRIVILEGED == 1 )); then
-    mapped_uid=$((100000 + BINDERY_UID))
-  else
-    mapped_uid=$BINDERY_UID
-  fi
-
-  PERMISSION_MODE=$(whiptail --backtitle "Bindery Proxmox VE Helper" --title "Media Permissions" \
-    --menu "Bindery runs as UID $BINDERY_UID inside the LXC.\nOn the host this corresponds to UID $mapped_uid for this container type.\n\nHow should the helper handle the selected media folders?" \
-    22 94 8 \
-    "acl" "Add POSIX ACL access for Bindery (recommended for local Linux filesystems)" \
-    "existing" "Do not alter host permissions; use my existing ACL/ownership setup" \
+  local choice
+  choice=$(whiptail --backtitle "Bindery Proxmox VE Helper" --title "Media Access" \
+    --menu "Bindery needs access to the Downloads and Library folders.\n\nGranting access adds a permission for Bindery without changing file ownership. Choose the first option for most local Linux disks." \
+    22 100 9 \
+    "recommended" "Grant access to the selected folders and newly created files (recommended)" \
+    "existing-files" "Also grant access to every existing file and subfolder" \
+    "manual" "Do not change permissions; I manage access on the storage/server" \
     3>&1 1>&2 2>&3) || return 1
 
-  ACL_RECURSIVE=0
-  if [[ "$PERMISSION_MODE" == "acl" ]]; then
-    if wt_yesno "Existing Media" \
-      "Apply Bindery's ACL to EXISTING files and subfolders too?\n\nYes is useful when importing/scanning an existing Audiobookshelf library.\nNo only updates the selected folder and default ACL for newly created content." 16 84; then
+  case "$choice" in
+    recommended)
+      PERMISSION_MODE="acl"
+      ACL_RECURSIVE=0
+      ;;
+    existing-files)
+      PERMISSION_MODE="acl"
       ACL_RECURSIVE=1
-    fi
-  fi
+      ;;
+    manual)
+      PERMISSION_MODE="existing"
+      ACL_RECURSIVE=0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 select_telemetry() {
@@ -756,7 +768,7 @@ select_telemetry() {
 }
 
 summary_and_confirm() {
-  local priv="Unprivileged" network media ipv6 telemetry
+  local priv="Unprivileged" network media ipv6 telemetry permission
   (( UNPRIVILEGED == 0 )) && priv="Privileged"
   if [[ "$IPV4_MODE" == "dhcp" ]]; then
     network="DHCP"
@@ -781,6 +793,13 @@ summary_and_confirm() {
   else
     telemetry="Enabled for upstream Bindery"
   fi
+  if [[ "$PERMISSION_MODE" == "existing" ]]; then
+    permission="Use existing permissions"
+  elif (( ACL_RECURSIVE == 1 )); then
+    permission="Grant access, including existing content"
+  else
+    permission="Grant access to folders and new content"
+  fi
 
   wt_yesno "Ready to Create" \
 "Bindery LXC configuration
@@ -793,6 +812,7 @@ Root disk:         ${DISK} GB on $ROOTFS_STORAGE
 Container:         $priv
 Network:           $BRIDGE | $network${VLAN:+ | VLAN $VLAN}
 IPv6:              $ipv6
+Nesting:           Enabled for Debian 13 systemd isolation
 Start on boot:     $ONBOOT
 SSH:               $ENABLE_SSH
 
@@ -804,7 +824,7 @@ Downloads in CT:   $DOWNLOAD_CT
 Audiobooks in CT:  $AUDIOBOOK_CT
 Hardlink capable:  $HARDLINK_STATUS
 Path remap:        $remap
-Permission mode:   $PERMISSION_MODE
+Media access:      $permission
 Telemetry:         $telemetry
 
 Create the container now?" 35 104
@@ -823,7 +843,9 @@ ensure_acl_tool() {
 grant_traverse_acl() {
   local base="$1" target="$2" uid="$3"
   local rel part cur
-  setfacl -m "u:${uid}:rx" -- "$base" 2>/dev/null || return 1
+  # Traversal needs execute only. Do not grant directory-listing access to
+  # sibling names on a shared media root or intermediate directory.
+  setfacl -m "u:${uid}:--x" -- "$base" 2>/dev/null || return 1
   rel=$(relative_to "$base" "$target")
   [[ -z "$rel" ]] && return 0
   cur="$base"
@@ -831,7 +853,7 @@ grant_traverse_acl() {
   for part in "${parts[@]}"; do
     cur="$cur/$part"
     [[ "$cur" == "$target" ]] && break
-    setfacl -m "u:${uid}:rx" -- "$cur" 2>/dev/null || return 1
+    setfacl -m "u:${uid}:--x" -- "$cur" 2>/dev/null || return 1
   done
 }
 
@@ -934,6 +956,29 @@ configure_host_permissions() {
 }
 
 # ---------- Debian template ----------
+proxmox_template_arch() {
+  local machine="${1:-}"
+  [[ -n "$machine" ]] || machine=$(uname -m)
+  case "$machine" in
+    x86_64|amd64) printf 'amd64\n' ;;
+    aarch64|arm64) printf 'arm64\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+verify_created_lxc_arch() {
+  local ctid="$1" expected_arch="$2" config detected_arch
+  if ! config=$(pct config "$ctid" 2>/dev/null); then
+    msg_err "Could not read the architecture of newly created LXC $ctid. It was not started or given media access."
+    return 1
+  fi
+  detected_arch=$(awk -F': ' '$1 == "arch" { print $2; exit }' <<<"$config")
+  if [[ "$detected_arch" != "$expected_arch" ]]; then
+    msg_err "Proxmox detected container architecture '${detected_arch:-unknown}', but this host requires '$expected_arch'. LXC $ctid was created but was not started or given media access."
+    return 1
+  fi
+}
+
 select_template_storage_auto() {
   local line
   line=$(pvesm status --content vztmpl 2>/dev/null | awk 'NR>1 && $3=="active" {print $1; exit}')
@@ -945,7 +990,7 @@ select_template_storage_auto() {
 }
 
 get_debian13_template() {
-  local tmpl_storage template_name
+  local tmpl_storage template_name template_arch dpkg_arch template_list
   tmpl_storage=$(select_template_storage_auto)
   if [[ -z "$tmpl_storage" ]]; then
     msg_err "No Proxmox storage supporting container templates (vztmpl) was found."
@@ -955,13 +1000,36 @@ get_debian13_template() {
   msg_info "Refreshing Proxmox appliance template index"
   pveam update >/dev/null
 
-  template_name=$(pveam available --section system 2>/dev/null | awk '$2 ~ /^debian-13-standard_/ {print $2}' | sort -V | tail -n1)
+  if ! template_arch=$(proxmox_template_arch); then
+    msg_err "Unsupported Proxmox host architecture: $(uname -m)"
+    return 1
+  fi
+  if ! dpkg_arch=$(dpkg --print-architecture 2>/dev/null) || [[ -z "$dpkg_arch" ]]; then
+    msg_err "Could not determine the Proxmox host package architecture."
+    return 1
+  fi
+  if [[ "$dpkg_arch" != "$template_arch" ]]; then
+    msg_err "Host architecture checks disagree (kernel: $(uname -m), packages: $dpkg_arch). Refusing to select an LXC template."
+    return 1
+  fi
+  TEMPLATE_ARCH="$template_arch"
+
+  template_list=$(LC_ALL=C pveam available --section system 2>/dev/null) || {
+    msg_err "Could not read the Proxmox appliance template index."
+    return 1
+  }
+  template_name=$(awk -v arch="$template_arch" '
+    $1 == "system" && $2 ~ /^debian-13-standard_/ &&
+      $2 ~ ("_" arch "\\.tar(\\.(gz|xz|zst|bz2))?$") &&
+      (NF < 3 || $3 == arch) { print $2 }
+  ' <<<"$template_list" | sort -V | tail -n1)
   if [[ -z "$template_name" ]]; then
-    msg_err "No Debian 13 standard LXC template is available from pveam."
+    msg_err "No Debian 13 standard $template_arch LXC template is available from pveam."
     return 1
   fi
 
-  if ! pveam list "$tmpl_storage" 2>/dev/null | grep -Fq "$template_name"; then
+  TEMPLATE_VOLID="${tmpl_storage}:vztmpl/${template_name}"
+  if ! pveam list "$tmpl_storage" 2>/dev/null | awk -v volid="$TEMPLATE_VOLID" '$1 == volid { found=1 } END { exit !found }'; then
     msg_info "Downloading Debian 13 LXC template: $template_name"
     pveam download "$tmpl_storage" "$template_name" >/dev/null
     msg_ok "Downloaded Debian 13 template"
@@ -969,7 +1037,10 @@ get_debian13_template() {
     msg_ok "Debian 13 template is already available"
   fi
 
-  TEMPLATE_VOLID="${tmpl_storage}:vztmpl/${template_name}"
+  if ! pveam list "$tmpl_storage" 2>/dev/null | awk -v volid="$TEMPLATE_VOLID" '$1 == volid { found=1 } END { exit !found }'; then
+    msg_err "The downloaded template cannot be resolved as $TEMPLATE_VOLID."
+    return 1
+  fi
 }
 
 # ---------- inner container files ----------
@@ -1954,6 +2025,7 @@ create_lxc() {
     --rootfs "${ROOTFS_STORAGE}:${DISK}"
     --net0 "$net0"
     --unprivileged "$UNPRIVILEGED"
+    --features "nesting=1"
     --onboot "$ONBOOT"
     --tags "$TAGS"
   )
@@ -1961,6 +2033,11 @@ create_lxc() {
 
   pct create "${create_args[@]}"
   msg_ok "Created LXC $CTID"
+
+  # PCT detects the extracted template's ELF architecture when --arch is not
+  # forced. Compare that independent result with the host-specific template
+  # selection before attaching host media or changing permissions.
+  verify_created_lxc_arch "$CTID" "$TEMPLATE_ARCH" || return 1
 
   # Re-resolve the exact kernel mount identities at the last possible moment.
   # If a NAS/disk disappeared during CT creation, do not attach the underlying
