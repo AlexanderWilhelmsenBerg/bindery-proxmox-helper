@@ -467,4 +467,3 @@ If the pre-start guard blocks the LXC, restore the exact selected host mount fir
 ## License
 
 The helper is MIT-licensed. Bindery has its own upstream license and ships its own third-party notices inside every release archive.
-
