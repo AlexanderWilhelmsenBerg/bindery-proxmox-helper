@@ -681,4 +681,3 @@ fi
 ok "IPv6 choice, command-line password safety and DNS/HTTPS readiness"
 
 printf '\nAll smoke tests passed.\n'
-
