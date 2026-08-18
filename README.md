@@ -45,6 +45,7 @@ The default setup creates:
 | Root disk | 8 GB on the Proxmox storage you select |
 | Networking | DHCP for IPv4; you explicitly choose the IPv6 mode |
 | Security | Unprivileged LXC |
+| Nesting | Enabled for Debian 13 systemd service isolation |
 | Start at boot | Enabled |
 | SSH | Not installed |
 | Bindery port | 8787 |
@@ -141,10 +142,13 @@ All media mount entries use `backup=0`, so Proxmox container backups do not try 
 
 1. finds active Proxmox storage that accepts `vztmpl`;
 2. refreshes the `pveam` index;
-3. selects the newest Debian 13 standard template; and
-4. downloads it only when it is not already present.
+3. maps an x86-64 host to `amd64` or an ARM64 host to `arm64`;
+4. selects the newest Debian 13 standard template whose filename has that exact architecture; and
+5. downloads it only when it is not already present.
 
-`create_lxc` builds a quoted argument array and calls `pct create`. User-selected values are passed as arguments, not evaluated as shell code.
+`pct create` is left to inspect the template binary itself. Immediately after creation, the helper compares Proxmox's detected container architecture with the architecture selected above and stops before attaching media, changing permissions, or starting the LXC if they differ.
+
+`create_lxc` builds a quoted argument array and calls `pct create`. User-selected values are passed as arguments, not evaluated as shell code. It enables only Proxmox's `nesting=1` feature so Debian 13 systemd can apply the Bindery service's mount-namespace isolation. Proxmox documents that nesting exposes some host `/proc` and `/sys` information to the guest, which is why the helper defaults to an unprivileged LXC and gives an additional warning before allowing the privileged-plus-nesting combination.
 
 The helper then:
 
@@ -177,14 +181,13 @@ This makes the LXC node-local. Before migrating it to another Proxmox node, recr
 
 Bindery runs as UID/GID `1000:1000` inside the LXC.
 
-For a standard unprivileged LXC, UID 1000 maps to host UID 101000. The wizard can:
+For a standard unprivileged LXC, UID 1000 maps to host UID 101000. For ordinary local Linux storage, choose **Grant access to the selected folders and newly created files** (recommended). The helper adds a named ACL for Bindery without changing ownership. This mode does not modify pre-existing subdirectories, so files later placed inside one of those old subdirectories must already be accessible.
 
-- add an ACL only to the selected folder and default ACLs for new content; or
-- recursively add access to existing content.
+Choose **Also grant access to every existing file and subfolder** when importing an existing library; this writes persistent ACL entries throughout the selected trees. Choose **Do not change permissions** for NFS, CIFS/SMB, NTFS, exFAT, or any setup where access is managed by the storage server or was configured separately.
 
 Recursive ACL handling refuses known child mounts and filters every entry by device ID. It does not walk into another filesystem.
 
-The helper never uses `chmod 777` and never changes ownership of the media tree. On NFS/CIFS or another filesystem where local POSIX ACLs are inappropriate, select “existing permissions” and configure access at the storage server.
+The helper never uses `chmod 777` and never changes ownership of the media tree.
 
 ### 8. Container startup and networking
 
@@ -464,3 +467,4 @@ If the pre-start guard blocks the LXC, restore the exact selected host mount fir
 ## License
 
 The helper is MIT-licensed. Bindery has its own upstream license and ships its own third-party notices inside every release archive.
+
