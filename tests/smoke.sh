@@ -412,8 +412,12 @@ if (( equals_path_allowed == 1 )); then
     || fail "equals-containing audiobook path lacks explicit Proxmox volume= syntax"
 fi
 
-acl_xdev_count=$(grep -Fc 'find "$path" -xdev' "$SCRIPT" || true)
-(( acl_xdev_count >= 2 )) || fail "recursive ACL traversal is not filesystem-bound with -xdev"
+grep -Fq 'find "$path" -xdev -type "$file_type"' "$SCRIPT" \
+  || fail "recursive ACL traversal is not filesystem-bound with -xdev"
+grep -Fq 'apply_acl_batch_on_device "$path" "$start_dev" d' "$SCRIPT" \
+  || fail "recursive directory ACLs do not use the filesystem-bound batch helper"
+grep -Fq 'apply_acl_batch_on_device "$path" "$start_dev" f' "$SCRIPT" \
+  || fail "recursive file ACLs do not use the filesystem-bound batch helper"
 ok "basic safety invariants and filesystem-bound ACL traversal"
 
 updater_lock=$(sed -nE 's/^LOCK_FILE="([^"]+)"$/\1/p' "$TMP/bindery-update" | head -n1)
