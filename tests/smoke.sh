@@ -27,13 +27,18 @@ blocks = {
     "install-inner.sh": ("<<'INSTALL_EOF'\n", "\nINSTALL_EOF"),
     "media-mount-guard": ("<<'GUARD'\n", "\nGUARD"),
 }
+prefixes = {
+    # The real generated guard gets this preamble immediately before the
+    # heredoc. Preserve its shell identity when linting the extracted body.
+    "media-mount-guard": "#!/bin/bash\n",
+}
 for name, (start_marker, end_marker) in blocks.items():
     try:
         start = src.index(start_marker) + len(start_marker)
         end = src.index(end_marker, start)
     except ValueError as exc:
         raise SystemExit(f"cannot extract {name}: {exc}")
-    (out / name).write_text(src[start:end] + "\n")
+    (out / name).write_text(prefixes.get(name, "") + src[start:end] + "\n")
 PY
 
 bash -n "$TMP/bindery-update"
