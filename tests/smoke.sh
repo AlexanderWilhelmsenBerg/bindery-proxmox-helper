@@ -126,6 +126,137 @@ for bad in '-bindery' 'bindery-' 'bindery..media' 'bad_name'; do
 done
 ok "IPv4/CIDR and hostname validation"
 
+[[ $(proxmox_template_arch x86_64) == amd64 ]] || fail "x86_64 did not map to amd64"
+[[ $(proxmox_template_arch amd64) == amd64 ]] || fail "amd64 template alias was rejected"
+[[ $(proxmox_template_arch aarch64) == arm64 ]] || fail "aarch64 did not map to arm64"
+[[ $(proxmox_template_arch arm64) == arm64 ]] || fail "arm64 template alias was rejected"
+if proxmox_template_arch ppc64le >/dev/null 2>&1; then
+  fail "unsupported Proxmox template architecture was accepted"
+fi
+
+# Present a newer incompatible template than every compatible one. The helper
+# must filter by the final architecture token before version sorting, for both
+# supported host families.
+mkdir -p "$TMP/template-bin"
+TEMPLATE_DOWNLOAD_LOG="$TMP/template-downloads.log"
+TEMPLATE_CACHE_STATE="$TMP/template-cache-state"
+export TEMPLATE_DOWNLOAD_LOG TEMPLATE_CACHE_STATE
+cat > "$TMP/template-bin/uname" <<'MOCK'
+#!/usr/bin/env bash
+[[ ${1:-} == -m ]] || exit 2
+printf '%s\n' "$MOCK_MACHINE"
+MOCK
+cat > "$TMP/template-bin/dpkg" <<'MOCK'
+#!/usr/bin/env bash
+[[ ${1:-} == --print-architecture ]] || exit 2
+case "$MOCK_MACHINE" in
+  x86_64) printf 'amd64\n' ;;
+  aarch64) printf 'arm64\n' ;;
+  *) exit 2 ;;
+esac
+MOCK
+cat > "$TMP/template-bin/pveam" <<'MOCK'
+#!/usr/bin/env bash
+case "${1:-}" in
+  update) exit 0 ;;
+  available)
+    case "$MOCK_MACHINE" in
+      x86_64)
+        cat <<'LIST'
+system debian-13-standard_13.0-1_amd64.tar.zst amd64
+system debian-13-standard_12.9-1_amd64.tar.bz2 amd64
+system debian-13-standard_13.1-1_amd64.tar.xz amd64
+system debian-13-standard_88.0-1_amd64.tar.zst arm64
+system debian-13-standard_99.0-1_arm64.tar.gz arm64
+system debian-13-standard_100.0-1_amd64.tar.zst.sig amd64
+LIST
+        ;;
+      aarch64)
+        cat <<'LIST'
+system debian-13-standard_13.0-1_arm64.tar.zst arm64
+system debian-13-standard_12.9-1_arm64.tar arm64
+system debian-13-standard_13.1-1_arm64.tar.gz arm64
+system debian-13-standard_88.0-1_arm64.tar.zst amd64
+system debian-13-standard_99.0-1_amd64.tar.xz amd64
+system debian-13-standard_100.0-1_arm64.tar.zst.sig arm64
+LIST
+        ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  list)
+    if [[ -s "$TEMPLATE_CACHE_STATE" ]]; then
+      printf 'local:vztmpl/%s\n' "$(< "$TEMPLATE_CACHE_STATE")"
+    else
+      printf 'VOLID\n'
+    fi
+    ;;
+  download)
+    printf '%s\n' "$3" >> "$TEMPLATE_DOWNLOAD_LOG"
+    printf '%s\n' "$3" > "$TEMPLATE_CACHE_STATE"
+    ;;
+  *) exit 2 ;;
+esac
+MOCK
+chmod +x "$TMP/template-bin/uname" "$TMP/template-bin/dpkg" "$TMP/template-bin/pveam"
+
+for template_case in \
+  'x86_64|amd64|debian-13-standard_13.1-1_amd64.tar.xz|arm64' \
+  'aarch64|arm64|debian-13-standard_13.1-1_arm64.tar.gz|amd64'; do
+  IFS='|' read -r MOCK_MACHINE expected_arch expected_template forbidden_arch <<< "$template_case"
+  export MOCK_MACHINE
+  : > "$TEMPLATE_DOWNLOAD_LOG"
+  : > "$TEMPLATE_CACHE_STATE"
+  (
+    select_template_storage_auto() { printf 'local\n'; }
+    PATH="$TMP/template-bin:$PATH" get_debian13_template
+    [[ "$TEMPLATE_ARCH" == "$expected_arch" ]] \
+      || fail "$MOCK_MACHINE selected template architecture '$TEMPLATE_ARCH'"
+    [[ "$TEMPLATE_VOLID" == "local:vztmpl/$expected_template" ]] \
+      || fail "$MOCK_MACHINE selected wrong template: $TEMPLATE_VOLID"
+  )
+  [[ $(wc -l < "$TEMPLATE_DOWNLOAD_LOG") -eq 1 ]] \
+    || fail "$MOCK_MACHINE did not download exactly one template"
+  grep -Fxq "$expected_template" "$TEMPLATE_DOWNLOAD_LOG" \
+    || fail "$MOCK_MACHINE did not download its matching template"
+  if grep -Fq "_${forbidden_arch}.tar." "$TEMPLATE_DOWNLOAD_LOG"; then
+    fail "$MOCK_MACHINE selected an incompatible $forbidden_arch template"
+  fi
+done
+unset MOCK_MACHINE TEMPLATE_DOWNLOAD_LOG TEMPLATE_CACHE_STATE
+ok "Proxmox template selection is architecture-specific"
+
+pct() {
+  [[ ${1:-} == config && ${2:-} == 490 ]] || return 2
+  printf 'arch: %s\n' "$MOCK_CREATED_ARCH"
+}
+MOCK_CREATED_ARCH=amd64
+verify_created_lxc_arch 490 amd64 || fail "matching Proxmox-detected architecture was rejected"
+MOCK_CREATED_ARCH=arm64
+if verify_created_lxc_arch 490 amd64 >/dev/null 2>&1; then
+  fail "mismatched Proxmox-detected architecture was accepted"
+fi
+unset MOCK_CREATED_ARCH
+unset -f pct
+ok "created LXC architecture verification fails closed"
+
+whiptail() { printf '%s\n' "$MOCK_PERMISSION_CHOICE" >&2; }
+MOCK_PERMISSION_CHOICE=recommended
+select_permission_mode || fail "recommended media-access choice was rejected"
+[[ "$PERMISSION_MODE" == acl && "$ACL_RECURSIVE" == 0 ]] \
+  || fail "recommended media access did not select nonrecursive ACLs"
+MOCK_PERMISSION_CHOICE=existing-files
+select_permission_mode || fail "existing-files media-access choice was rejected"
+[[ "$PERMISSION_MODE" == acl && "$ACL_RECURSIVE" == 1 ]] \
+  || fail "existing-files media access did not select recursive ACLs"
+MOCK_PERMISSION_CHOICE=manual
+select_permission_mode || fail "manual media-access choice was rejected"
+[[ "$PERMISSION_MODE" == existing && "$ACL_RECURSIVE" == 0 ]] \
+  || fail "manual media access unexpectedly changes permissions"
+unset MOCK_PERMISSION_CHOICE
+unset -f whiptail
+ok "plain media-access choices map to safe permission modes"
+
 whiptail() { printf '%s\n' "$MOCK_TELEMETRY_CHOICE" >&2; }
 MOCK_TELEMETRY_CHOICE=disabled
 select_telemetry || fail "disabled telemetry choice was rejected"
@@ -418,6 +549,8 @@ grep -Fq 'apply_acl_batch_on_device "$path" "$start_dev" d' "$SCRIPT" \
   || fail "recursive directory ACLs do not use the filesystem-bound batch helper"
 grep -Fq 'apply_acl_batch_on_device "$path" "$start_dev" f' "$SCRIPT" \
   || fail "recursive file ACLs do not use the filesystem-bound batch helper"
+[[ $(grep -Fc 'setfacl -m "u:${uid}:--x"' "$SCRIPT") -eq 2 ]] \
+  || fail "ancestor traversal ACLs grant more than execute-only access"
 ok "basic safety invariants and filesystem-bound ACL traversal"
 
 updater_lock=$(sed -nE 's/^LOCK_FILE="([^"]+)"$/\1/p' "$TMP/bindery-update" | head -n1)
@@ -514,6 +647,27 @@ ok "media mount availability and LXC pre-start guards"
 create_lxc_body=$(awk '/^create_lxc\(\) \{/{capture=1} capture{print} capture && /^}/{exit}' "$SCRIPT")
 [[ -n "$create_lxc_body" ]] || fail "could not extract create_lxc"
 grep -Fq 'case "$IPV6_MODE" in' <<<"$create_lxc_body" || fail "IPv6 mode is not applied during LXC creation"
+create_lxc_noncomments=$(sed '/^[[:space:]]*#/d' <<<"$create_lxc_body")
+if grep -Eq -- '(^|[[:space:]])--arch([[:space:]]|$)' <<<"$create_lxc_noncomments"; then
+  fail "pct create bypasses Proxmox template architecture detection with --arch"
+fi
+grep -Fq 'verify_created_lxc_arch "$CTID" "$TEMPLATE_ARCH" || return 1' <<<"$create_lxc_body" \
+  || fail "created LXC architecture is not verified against the host architecture"
+arch_create_line=$(grep -nF 'pct create "${create_args[@]}"' <<<"$create_lxc_body" | cut -d: -f1)
+arch_guard_line=$(grep -nF 'verify_created_lxc_arch "$CTID" "$TEMPLATE_ARCH" || return 1' <<<"$create_lxc_body" | cut -d: -f1)
+media_revalidation_line=$(grep -nF 'if ! revalidate_media_mounts; then' <<<"$create_lxc_body" | head -n1 | cut -d: -f1)
+media_attach_line=$(grep -nF 'pct set "$CTID" --mp0' <<<"$create_lxc_body" | head -n1 | cut -d: -f1)
+acl_setup_line=$(grep -nF 'configure_host_permissions' <<<"$create_lxc_body" | head -n1 | cut -d: -f1)
+container_start_line=$(grep -nF 'pct start "$CTID"' <<<"$create_lxc_body" | head -n1 | cut -d: -f1)
+[[ -n "$arch_create_line" && -n "$arch_guard_line" && -n "$media_revalidation_line" \
+    && -n "$media_attach_line" && -n "$acl_setup_line" && -n "$container_start_line" ]] \
+  || fail "could not locate post-create architecture guard ordering"
+(( arch_create_line < arch_guard_line && arch_guard_line < media_revalidation_line )) \
+  || fail "created LXC architecture does not fail closed before media access"
+(( arch_guard_line < media_attach_line && arch_guard_line < acl_setup_line && arch_guard_line < container_start_line )) \
+  || fail "architecture mismatch can reach media attachment, ACL changes, or container start"
+grep -Fq -- '--features "nesting=1"' <<<"$create_lxc_body" \
+  || fail "Debian 13 LXC is missing systemd service-isolation nesting"
 grep -Fq 'ip6=auto' <<<"$create_lxc_body" || fail "IPv6 SLAAC option missing"
 grep -Fq 'ip6=dhcp' <<<"$create_lxc_body" || fail "DHCPv6 option missing"
 grep -Fq 'manual)' <<<"$create_lxc_body" || fail "explicit no-automatic-IPv6 option missing"
@@ -527,3 +681,4 @@ fi
 ok "IPv6 choice, command-line password safety and DNS/HTTPS readiness"
 
 printf '\nAll smoke tests passed.\n'
+
